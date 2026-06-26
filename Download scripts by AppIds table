@@ -1,0 +1,79 @@
+(async () => {
+  // ===== список appId =====
+  const APP_IDS = [
+   'ВАШ-APP-ID',
+  ];
+  const TIMEOUT_MS = 30000;   // скрипты бывают большими
+  const CONCURRENCY = 3;
+
+  const m = location.pathname.match(/^(.*?)\/(hub|sense|dev-hub)\b/i);
+  const PREFIX = m ? m[1] : '';
+  const HTTP = location.origin + PREFIX;
+  const WS   = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + PREFIX;
+
+  // ---- xrfkey + CSRF ----
+  const xrf = Array.from({length:16}, () => 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'[Math.floor(Math.random()*62)]).join('');
+  let CSRF = null;
+  try {
+    const r = await fetch(`${HTTP}/qps/csrftoken?Xrfkey=${xrf}`, { headers: { 'X-Qlik-Xrfkey': xrf }, credentials: 'include' });
+    for (const [k, v] of r.headers.entries()) if (/csrf/i.test(k)) { CSRF = v; break; }
+    console.log('[csrf] status', r.status, '| token', CSRF ? CSRF.slice(0,6)+'…' : '(НЕ найден)');
+  } catch (e) { console.error('[csrf] fail', e); }
+
+  const wsUrl = id => { const q = ['Xrfkey=' + xrf]; if (CSRF) q.push('qlik-csrf-token=' + encodeURIComponent(CSRF)); return `${WS}/app/${encodeURIComponent(id)}?` + q.join('&'); };
+
+  function getScript(appId) {
+    return new Promise(resolve => {
+      let done = false, ws, rid = 0, appH, title = null, idOpen, idProps, idScript;
+      const fin = (script, err) => { if (done) return; done = true; clearTimeout(timer); try{ws&&ws.readyState===1&&ws.close();}catch(_){}; resolve({ appId, title, script: script || '', error: err || null }); };
+      const timer = setTimeout(() => fin('', 'timeout'), TIMEOUT_MS);
+      try { ws = new WebSocket(wsUrl(appId)); } catch (e) { return fin('', 'ctor'); }
+      const send = (mth, h, p) => { const id = ++rid; ws.send(JSON.stringify({ jsonrpc:'2.0', id, method:mth, handle:h, params:p })); return id; };
+      ws.onopen = () => { idOpen = send('OpenDoc', -1, [appId, '', '', '', true]); };
+      ws.onclose = () => { if (!done) fin('', 'closed'); };
+      ws.onmessage = ev => {
+        let r; try { r = JSON.parse(ev.data); } catch(_){ return; }
+        if (typeof r.id !== 'number') return;
+        if (r.error) return fin('', r.error.message || 'rpc error');
+        if (r.id === idOpen) {
+          appH = r.result.qReturn.qHandle;
+          idProps = send('GetAppProperties', appH, []);
+        } else if (r.id === idProps) {
+          title = (r.result && r.result.qProp && r.result.qProp.qTitle) || null;
+          idScript = send('GetScript', appH, {});
+        } else if (r.id === idScript) {
+          fin((r.result && r.result.qScript) || '', null);
+        }
+      };
+    });
+  }
+
+  async function mapPool(items, fn, limit) {
+    const res = new Array(items.length); let idx = 0;
+    await Promise.all(Array.from({ length: Math.min(limit, items.length) }, async () => { while (idx < items.length) { const i = idx++; res[i] = await fn(items[i], i); } }));
+    return res;
+  }
+
+  const out = await mapPool(APP_IDS, async (id, i) => {
+    const r = await getScript(id);
+    console.log(`[${i+1}/${APP_IDS.length}]`, r.title || id, '|', r.error ? 'ОШИБКА: ' + r.error : (r.script.length + ' симв.'));
+    return r;
+  }, CONCURRENCY);
+
+  window.__qlikScripts = out;
+
+  // ---- сборка одного .txt ----
+  const div = '='.repeat(80);
+  const parts = out.map(o => {
+    const head = `${div}\r\nПРИЛОЖЕНИЕ: ${o.title || '(имя недоступно)'}\r\nID:         ${o.appId}\r\n${o.error ? 'СТАТУС:     НЕ ПОЛУЧЕНО (' + o.error + ')\r\n' : ''}${div}\r\n`;
+    return head + (o.script || '') + '\r\n\r\n';
+  });
+  const text = '\uFEFF' + `Выгрузка скриптов загрузки Qlik Sense\r\nДата: ${new Date().toLocaleString()}\r\nПриложений: ${out.length}\r\n\r\n` + parts.join('');
+
+  const blob = new Blob([text], { type: 'text/plain;charset=utf-8;' });
+  const url = URL.createObjectURL(blob);
+  const a = Object.assign(document.createElement('a'), { href: url, download: 'qlik_load_scripts_' + new Date().toISOString().slice(0,19).replace(/[:T]/g,'-') + '.txt' });
+  document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
+  console.log('[txt] скачан | приложений:', out.length, '| ошибок:', out.filter(o => o.error).length);
+  return out;
+})();
