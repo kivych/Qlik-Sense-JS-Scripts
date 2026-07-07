@@ -1,18 +1,27 @@
 /* ============================================================================
  * Kerbatov metadata downloader · экспорт метаданных Qlik Sense
  * ----------------------------------------------------------------------------
- * Вставь весь файл в консоль DevTools, будучи авторизованным в хабе Qlik Sense.
- * Появится панель: выбор источника, типов данных, формата и режима файлов.
+ * Вставь весь файл в консоль DevTools, будучи авторизованным в Qlik Sense
+ * (хаб, приложение или редактор загрузки — прокси-префикс определится сам).
  *
- * Источники:   текущее приложение · список appId · поток по имени · все на сервере
- * Данные:      Меры · Измерения · Переменные · Листы(Id+thumbnail) ·
- *              Общая инфа+thumbnail · Скрипты загрузки
- * Форматы:     CSV (разделитель задаётся) · JSON · XML
- * Файлы:       один · отдельный на каждое приложение
+ * Источники:  текущее приложение · список appId · поток по имени · все на сервере
+ *             + фильтр по маске имени приложения (* и ?)
+ * Данные:     Меры · Измерения · Переменные · Листы(Id+thumbnail) · Закладки ·
+ *             Мастер-объекты · Общая инфа (thumbnail, тема, поток, публикация,
+ *             lastReload) · Скрипты загрузки
+ * Форматы:    CSV (свой разделитель) · JSON · XML
+ *             В JSON скрипт хранится массивом строк scriptLines (спецификация
+ *             JSON не допускает сырых переносов в строке; join('\n') вернёт код).
+ * Разбиение:  галка «файл на приложение» × галка «файл на вид данных»
+ * Дополнительно: упаковка в один ZIP (без библиотек, store) · «только проверка»
+ *             (сводка без скачивания) · манифест ошибок · кнопка «Повтор ошибок»
+ *             (перегоняет только сбойные приложения) · настраиваемый параллелизм
  *
- * Транспорт:   QPS CSRF-токен -> WebSocket Engine API (OpenDoc/GetScript/списки),
- *              QRS REST для состава потока / списка всех приложений.
- * Без внешних библиотек и CDN (xlsx офлайн недоступен -> CSV/JSON/XML).
+ * Надёжность: автоподбор прокси-префикса (dev/dataloadeditor/дефолтный) ·
+ *             изолированные engine-сессии (identity) · повтор при сбоях сети ·
+ *             честная проба движка (GetDocList) · кнопка Стоп · прогресс-бар ·
+ *             автосохранение настроек · уникальные имена файлов ·
+ *             единый штамп времени на прогон
  * ==========================================================================*/
 (() => {
   // ---------- очистка прошлой панели ----------
@@ -20,24 +29,49 @@
   document.getElementById('qme-style')?.remove();
 
   // ---------- общие хелперы ----------
-  const m = location.pathname.match(/^(.*?)\/(hub|sense|dev-hub)\b/i);
-  const PREFIX = m ? m[1] : '';
-  const HTTP = location.origin + PREFIX;
-  const WS = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + PREFIX;
+  let PREFIX = '', HTTP = location.origin, WS = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host;
+  const applyPrefix = p => { PREFIX = p || ''; HTTP = location.origin + PREFIX; WS = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + PREFIX; };
+  const prefixCandidates = () => {
+    const c = [];
+    const mm = location.pathname.match(/^(.*?)\/(hub|sense|dev-hub|dataloadeditor|single|app)\b/i);
+    if (mm) c.push(mm[1]);
+    const seg = location.pathname.split('/')[1];
+    if (seg) c.push('/' + seg);
+    c.push('');
+    return [...new Set(c)];
+  };
+  applyPrefix(prefixCandidates()[0]);
+
   const abs = u => (!u ? '' : (u.startsWith('http') ? u : HTTP + u));
   const sleep = ms => new Promise(r => setTimeout(r, ms));
   const grp = g => g === 'H' ? 'иерархия' : (g === 'N' ? 'одиночное' : (g || ''));
   const xrf = Array.from({ length: 16 }, () => 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'[Math.floor(Math.random() * 62)]).join('');
   let CSRF = null;
+  let ABORT = false;
+  let LAST_FAILED = [];   // приложения с ошибками последнего прогона — для кнопки «Повтор ошибок»
   const ts = () => new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
   const safe = s => String(s || 'app').replace(/[^\p{L}\p{N}_-]+/gu, '_').slice(0, 60);
+  const maskToRe = mask => { const esc = mask.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*').replace(/\?/g, '.'); return new RegExp('^' + esc + '$', 'i'); };
+  const splitLines = s => String(s || '').split(/\r\n|\n|\r/);
 
-  async function getCsrf() {
-    try {
-      const r = await fetch(`${HTTP}/qps/csrftoken?Xrfkey=${xrf}`, { headers: { 'X-Qlik-Xrfkey': xrf }, credentials: 'include' });
-      for (const [k, v] of r.headers.entries()) if (/csrf/i.test(k)) { CSRF = v; break; }
-    } catch (e) { log('CSRF: ' + e.message); }
+  async function authDetect() {
+    for (const p of prefixCandidates()) {
+      try {
+        const r = await fetch(`${location.origin}${p}/qps/csrftoken?Xrfkey=${xrf}`, { headers: { 'X-Qlik-Xrfkey': xrf }, credentials: 'include' });
+        if (r.ok) {
+          let tok = null;
+          for (const [k, v] of r.headers.entries()) if (/csrf/i.test(k)) { tok = v; break; }
+          applyPrefix(p); CSRF = tok;
+          log(`Прокси: "${p || '(дефолтный)'}" · CSRF: ${tok ? 'ок' : 'не отдан (продолжаю)'}`);
+          return true;
+        }
+        log(`Прокси "${p || '(дефолтный)'}": csrftoken → ${r.status}`);
+      } catch (e) { log(`Прокси "${p || '(дефолтный)'}": ${e.message}`); }
+    }
+    log('Ни один прокси не подтвердил сессию — пробую с текущим префиксом, но возможны отказы.');
+    return false;
   }
+
   const wsUrl = (id, identity) => { const q = ['Xrfkey=' + xrf]; if (CSRF) q.push('qlik-csrf-token=' + encodeURIComponent(CSRF)); const idp = identity ? `/identity/${encodeURIComponent(identity)}` : ''; return `${WS}/app/${encodeURIComponent(id)}${idp}?` + q.join('&'); };
 
   async function qrsGet(path) {
@@ -51,12 +85,15 @@
   const CALL_TIMEOUT = 30000, CONNECT_TIMEOUT = 20000;
   function openWs(id) {
     return new Promise((resolve, reject) => {
-      const identity = 'kmd_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8); // изолированная сессия: не конфликтует с уже открытым приложением
+      const identity = 'kmd_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
       let ws; try { ws = new WebSocket(wsUrl(id, identity)); } catch (e) { return reject(e); }
-      const pending = new Map(); let nid = 0, closed = false;
+      const pending = new Map(); let nid = 0, closed = false, opened = false;
       const fail = err => { if (closed) return; closed = true; for (const p of pending.values()) p.reject(err); };
-      const connTimer = setTimeout(() => reject(new Error('ws connect timeout')), CONNECT_TIMEOUT);
-      ws.onclose = () => fail(new Error('ws closed'));
+      const connTimer = setTimeout(() => { try { ws.close(); } catch {} reject(new Error('ws connect timeout')); }, CONNECT_TIMEOUT);
+      ws.onclose = () => {
+        if (!opened) { clearTimeout(connTimer); if (!closed) { closed = true; reject(new Error('ws closed до установления сессии (прокси/CSRF)')); } return; }
+        fail(new Error('ws closed'));
+      };
       ws.onerror = () => {};
       ws.onmessage = ev => { let r; try { r = JSON.parse(ev.data); } catch { return; } if (typeof r.id !== 'number') return;
         const p = pending.get(r.id); if (!p) return; pending.delete(r.id); r.error ? p.reject(new Error(r.error.message || 'rpc')) : p.resolve(r.result); };
@@ -66,12 +103,13 @@
         pending.set(i, { resolve: v => { clearTimeout(to); res(v); }, reject: e => { clearTimeout(to); rej(e); } });
         try { ws.send(JSON.stringify({ jsonrpc: '2.0', id: i, method, handle, params })); } catch (e) { clearTimeout(to); pending.delete(i); rej(e); }
       });
-      ws.onopen = () => { clearTimeout(connTimer); resolve({ call, close: () => { try { ws.close(); } catch {} } }); };
+      ws.onopen = () => { opened = true; clearTimeout(connTimer); resolve({ call, close: () => { try { ws.close(); } catch {} } }); };
     });
   }
 
   async function collectApp(appId, sel) {
-    const res = { appId, appName: null, thumbnail: '', lastReload: null, variables: [], dimensions: [], measures: [], sheets: [], script: '', error: null };
+    const res = { appId, appName: null, thumbnail: '', theme: '', stream: '', published: null, lastReload: null,
+      variables: [], dimensions: [], measures: [], sheets: [], bookmarks: [], masterobjects: [], script: '', error: null };
     let conn;
     try {
       conn = await openWs(appId);
@@ -79,11 +117,15 @@
       const props = await conn.call('GetAppProperties', appH, []);
       res.appName = props.qProp?.qTitle ?? null;
       res.thumbnail = abs(props.qProp?.qThumbnail?.qUrl);
-      if (sel.general) { try { res.lastReload = (await conn.call('GetAppLayout', appH, [])).qLayout?.qLastReloadTime ?? null; } catch {} }
       const fetchList = async (qType, defKey, def, lk) => {
         const c = await conn.call('CreateSessionObject', appH, [{ qInfo: { qType }, [defKey]: def }]);
         return (await conn.call('GetLayout', c.qReturn.qHandle, [])).qLayout?.[lk]?.qItems || [];
       };
+      if (sel.general) {
+        try { res.lastReload = (await conn.call('GetAppLayout', appH, [])).qLayout?.qLastReloadTime ?? null; } catch {}
+        try { const ap = await fetchList('AppPropsList', 'qAppObjectListDef', { qType: 'appprops', qData: { theme: '/theme' } }, 'qAppObjectList');
+          res.theme = (ap[0]?.qData?.theme) || ''; } catch {}
+      }
       if (sel.variables) res.variables = (await fetchList('VariableList', 'qVariableListDef', { qType: 'variable', qShowReserved: false, qShowConfig: false, qData: { tags: '/tags' } }, 'qVariableList'))
         .map(v => ({ name: v.qName, definition: v.qDefinition, description: v.qDescription, scriptCreated: !!v.qIsScriptCreated }));
       if (sel.dimensions) res.dimensions = (await fetchList('DimensionList', 'qDimensionListDef', { qType: 'dimension', qData: { grouping: '/qDim/qGrouping', fields: '/qDim/qFieldDefs', labelExpr: '/qDim/qLabelExpression' } }, 'qDimensionList'))
@@ -92,90 +134,224 @@
         .map(me => ({ id: me.qInfo.qId, title: me.qMeta?.title, definition: me.qData?.def, label: me.qData?.label, labelExpr: me.qData?.labelExpr, description: me.qMeta?.description, tags: me.qMeta?.tags || [] }));
       if (sel.sheets) res.sheets = (await fetchList('SheetList', 'qAppObjectListDef', { qType: 'sheet', qData: { title: '/qMetaDef/title', thumbnail: '/thumbnail' } }, 'qAppObjectList'))
         .map(s => { const t = s.qData?.thumbnail; return { sheetId: s.qInfo.qId, sheetName: s.qMeta?.title, thumbnail: abs(t && (t.qStaticContentUrl?.qUrl || t.qStaticContentUrlDef?.qUrl)) }; });
+      if (sel.bookmarks) res.bookmarks = (await fetchList('BookmarkList', 'qBookmarkListDef', { qType: 'bookmark', qData: { title: '/qMetaDef/title', description: '/qMetaDef/description', sheetId: '/sheetId', selectionFields: '/selectionFields', creationDate: '/creationDate' } }, 'qBookmarkList'))
+        .map(b => ({ id: b.qInfo.qId, title: b.qMeta?.title || b.qData?.title, description: b.qMeta?.description || b.qData?.description, sheetId: b.qData?.sheetId || '', fields: b.qData?.selectionFields || '', created: b.qData?.creationDate || '' }));
+      if (sel.masterobjects) res.masterobjects = (await fetchList('MasterObjectList', 'qAppObjectListDef', { qType: 'masterobject', qData: { title: '/qMetaDef/title', description: '/qMetaDef/description', visualization: '/visualization', tags: '/qMetaDef/tags' } }, 'qAppObjectList'))
+        .map(o => ({ id: o.qInfo.qId, title: o.qMeta?.title || o.qData?.title, visualization: o.qData?.visualization || '', description: o.qMeta?.description || o.qData?.description, tags: o.qMeta?.tags || [] }));
       if (sel.script) { try { res.script = (await conn.call('GetScript', appH, {})).qScript || ''; } catch (e) { if (!res.error) res.error = 'script: ' + e.message; } }
     } catch (e) { res.error = e.message || String(e); }
     finally { conn?.close(); }
     return res;
   }
 
+  const RETRIES = 2;
+  async function collectWithRetry(appId, sel) {
+    let last = null;
+    for (let att = 1; att <= RETRIES; att++) {
+      const r = await collectApp(appId, sel);
+      if (!r.error || !/ws closed|ws connect|timeout/i.test(r.error)) return r;
+      last = r;
+      if (att < RETRIES && !ABORT) { log(`   повтор ${att}/${RETRIES - 1} для ${appId}: ${r.error}`); await sleep(900); }
+    }
+    return last;
+  }
+
   // ---------- источник приложений ----------
   async function docListEngine() { const c = await openWs('engineData'); try { return ((await c.call('GetDocList', -1, [])).qDocList || []).map(d => ({ id: d.qDocId, name: d.qTitle || d.qDocName })); } finally { c.close(); } }
   async function resolveApps(cfg) {
-    if (cfg.source === 'current') { const mm = location.href.match(/\/app\/([^/?#]+)/); if (!mm) throw new Error('Текущее приложение не определено по URL — открой приложение или выбери другой источник.'); return [{ id: decodeURIComponent(mm[1]) }]; }
-    if (cfg.source === 'list') { const ids = cfg.idsText.split(/[\s,;]+/).map(s => s.trim()).filter(Boolean); if (!ids.length) throw new Error('Список appId пуст.'); return ids.map(id => ({ id })); }
-    if (cfg.source === 'stream') {
+    let apps;
+    if (cfg.source === 'current') {
+      const mm = location.href.match(/\/app\/([^/?#]+)/);
+      if (!mm) throw new Error('Текущее приложение не определено по URL — открой приложение или выбери другой источник.');
+      apps = [{ id: decodeURIComponent(mm[1]) }];
+    } else if (cfg.source === 'list') {
+      const ids = [...new Set(cfg.idsText.split(/[\s,;]+/).map(s => s.trim()).filter(Boolean))];
+      if (!ids.length) throw new Error('Список appId пуст.');
+      apps = ids.map(id => ({ id }));
+    } else if (cfg.source === 'stream') {
       if (!cfg.streamName) throw new Error('Укажи имя потока.');
       let arr = await qrsGet(`/qrs/app/full?filter=${encodeURIComponent(`stream.name eq '${cfg.streamName}'`)}`);
       if (!arr) throw new Error('QRS недоступен — состав потока через Repository не получить (нужны права).');
       if (!arr.length) { const all = await qrsGet('/qrs/app/full') || []; arr = all.filter(a => a.stream && a.stream.name?.toLowerCase() === cfg.streamName.toLowerCase());
         if (!arr.length) throw new Error(`Поток "${cfg.streamName}" не найден. Есть: ${[...new Set(all.filter(a => a.stream).map(a => a.stream.name))].sort().join(', ')}`); }
-      return arr.map(a => ({ id: a.id, name: a.name }));
+      apps = arr.map(a => ({ id: a.id, name: a.name }));
+    } else if (cfg.source === 'all') {
+      let all = await qrsGet('/qrs/app/full');
+      if (!all) { log('QRS недоступен — беру список из движка (GetDocList).'); apps = await docListEngine(); }
+      else apps = all.map(a => ({ id: a.id, name: a.name }));
+    } else throw new Error('Неизвестный источник.');
+
+    if (cfg.mask && (cfg.source === 'stream' || cfg.source === 'all')) {
+      const re = maskToRe(cfg.mask);
+      const before = apps.length;
+      apps = apps.filter(a => re.test(a.name || ''));
+      log(`Маска "${cfg.mask}": ${apps.length} из ${before}`);
     }
-    if (cfg.source === 'all') { let all = await qrsGet('/qrs/app/full'); if (!all) { log('QRS недоступен — беру список из движка (GetDocList).'); return docListEngine(); } return all.map(a => ({ id: a.id, name: a.name })); }
-    throw new Error('Неизвестный источник.');
+    return apps;
+  }
+
+  async function enrichFromQrs(results) {
+    const all = await qrsGet('/qrs/app/full');
+    if (!all) { log('QRS недоступен — поля "поток/публикация" останутся пустыми.'); return; }
+    const map = new Map(all.map(a => [a.id, a]));
+    for (const r of results) {
+      const q = map.get(r.appId); if (!q) continue;
+      r.stream = q.stream?.name || '';
+      r.published = !!q.published;
+      if (!r.appName && q.name) r.appName = q.name;
+    }
   }
 
   // ---------- сериализация ----------
   const SCHEMA = {
-    general:    ['appId', 'appName', 'thumbnail', 'lastReload'],
-    variables:  ['appId', 'appName', 'name', 'definition', 'description', 'scriptCreated'],
-    dimensions: ['appId', 'appName', 'id', 'title', 'fields', 'labelExpr', 'type', 'description', 'tags'],
-    measures:   ['appId', 'appName', 'id', 'title', 'definition', 'label', 'labelExpr', 'description', 'tags'],
-    sheets:     ['appId', 'appName', 'sheetId', 'sheetName', 'thumbnail'],
+    general:       ['appId', 'appName', 'thumbnail', 'theme', 'stream', 'published', 'lastReload'],
+    variables:     ['appId', 'appName', 'name', 'definition', 'description', 'scriptCreated'],
+    dimensions:    ['appId', 'appName', 'id', 'title', 'fields', 'labelExpr', 'type', 'description', 'tags'],
+    measures:      ['appId', 'appName', 'id', 'title', 'definition', 'label', 'labelExpr', 'description', 'tags'],
+    sheets:        ['appId', 'appName', 'sheetId', 'sheetName', 'thumbnail'],
+    bookmarks:     ['appId', 'appName', 'id', 'title', 'description', 'sheetId', 'fields', 'created'],
+    masterobjects: ['appId', 'appName', 'id', 'title', 'visualization', 'description', 'tags'],
+    script:        ['appId', 'appName', 'line'],
   };
-  const ITEMNAME = { variables: 'variable', dimensions: 'dimension', measures: 'measure', sheets: 'sheet' };
+  const DATA_CATS = ['variables', 'dimensions', 'measures', 'sheets', 'bookmarks', 'masterobjects'];   // вложенные списки приложения
+  const CATLABEL = { general: 'general', variables: 'variables', dimensions: 'dimensions', measures: 'measures', sheets: 'sheets', bookmarks: 'bookmarks', masterobjects: 'masterobjects', script: 'scripts' };
+  const ITEMNAME = { variables: 'variable', dimensions: 'dimension', measures: 'measure', sheets: 'sheet', bookmarks: 'bookmark', masterobjects: 'masterObject', script: 'scriptLine' };
   const flat = v => Array.isArray(v) ? v.join(', ') : (typeof v === 'boolean' ? (v ? 'да' : 'нет') : (v == null ? '' : v));
-  function rowsFor(cat, apps) { const rows = []; for (const a of apps) { if (cat === 'general') rows.push({ appId: a.appId, appName: a.appName, thumbnail: a.thumbnail, lastReload: a.lastReload }); else for (const it of a[cat]) rows.push({ appId: a.appId, appName: a.appName, ...it }); } return rows; }
-  function toCSV(cols, rows, delim) { const esc = v => { v = String(flat(v)); return (v.includes(delim) || v.includes('"') || /[\r\n]/.test(v)) ? '"' + v.replace(/"/g, '""') + '"' : v; }; return '\uFEFF' + [cols.join(delim), ...rows.map(r => cols.map(c => esc(r[c])).join(delim))].join('\r\n'); }
+
+  function rowsFor(cat, apps) {
+    const rows = [];
+    for (const a of apps) {
+      if (cat === 'general') rows.push({ appId: a.appId, appName: a.appName, thumbnail: a.thumbnail, theme: a.theme, stream: a.stream, published: a.published, lastReload: a.lastReload });
+      else if (cat === 'script') { for (const ln of splitLines(a.script)) rows.push({ appId: a.appId, appName: a.appName, line: ln }); }
+      else for (const it of a[cat]) rows.push({ appId: a.appId, appName: a.appName, ...it });
+    }
+    return rows;
+  }
+  function toCSV(cols, rows, delim, bom = true) {
+    const esc = v => { v = String(flat(v)); return (v.includes(delim) || v.includes('"') || /[\r\n]/.test(v)) ? '"' + v.replace(/"/g, '""') + '"' : v; };
+    return (bom ? '\uFEFF' : '') + [cols.join(delim), ...rows.map(r => cols.map(c => esc(r[c])).join(delim))].join('\r\n');
+  }
   const xe = v => String(v == null ? '' : v).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
   const cdata = s => '<![CDATA[' + String(s || '').replace(/]]>/g, ']]]]><![CDATA[>') + ']]>';
+  const XMLHEAD = '\uFEFF<?xml version="1.0" encoding="UTF-8"?>\n';
 
-  function appToObj(a, sel) { const o = { appId: a.appId, appName: a.appName }; if (sel.general) { o.thumbnail = a.thumbnail; o.lastReload = a.lastReload; } for (const c of ['variables', 'dimensions', 'measures', 'sheets']) if (sel[c]) o[c] = a[c]; if (sel.script) o.script = a.script || ''; if (a.error) o.error = a.error; return o; }
-  function appToXml(a, sel) { let s = `  <app id="${xe(a.appId)}" name="${xe(a.appName)}">\n`;
-    if (sel.general) s += `    <thumbnail>${xe(a.thumbnail)}</thumbnail>\n    <lastReload>${xe(a.lastReload)}</lastReload>\n`;
-    for (const c of ['variables', 'dimensions', 'measures', 'sheets']) { if (!sel[c]) continue; const items = a[c];
-      if (!items.length) { s += `    <${c}/>\n`; continue; } s += `    <${c}>\n`;
-      for (const it of items) { s += `      <${ITEMNAME[c]}>\n`; for (const [k, v] of Object.entries(it)) s += `        <${k}>${xe(flat(v))}</${k}>\n`; s += `      </${ITEMNAME[c]}>\n`; } s += `    </${c}>\n`; }
+  function appToObj(a, sel) {
+    const o = { appId: a.appId, appName: a.appName };
+    if (sel.general) { o.thumbnail = a.thumbnail; o.theme = a.theme; o.stream = a.stream; o.published = a.published; o.lastReload = a.lastReload; }
+    for (const c of DATA_CATS) if (sel[c]) o[c] = a[c];
+    if (sel.script) o.scriptLines = splitLines(a.script);
+    if (a.error) o.error = a.error;
+    return o;
+  }
+  function appToXml(a, sel) {
+    let s = `  <app id="${xe(a.appId)}" name="${xe(a.appName)}">\n`;
+    if (sel.general) s += `    <thumbnail>${xe(a.thumbnail)}</thumbnail>\n    <theme>${xe(a.theme)}</theme>\n    <stream>${xe(a.stream)}</stream>\n    <published>${xe(flat(a.published))}</published>\n    <lastReload>${xe(a.lastReload)}</lastReload>\n`;
+    for (const c of DATA_CATS) {
+      if (!sel[c]) continue; const items = a[c];
+      if (!items.length) { s += `    <${c}/>\n`; continue; }
+      s += `    <${c}>\n`;
+      for (const it of items) { s += `      <${ITEMNAME[c]}>\n`; for (const [k, v] of Object.entries(it)) s += `        <${k}>${xe(flat(v))}</${k}>\n`; s += `      </${ITEMNAME[c]}>\n`; }
+      s += `    </${c}>\n`;
+    }
     if (sel.script) s += `    <script>${cdata(a.script)}</script>\n`;
-    if (a.error) s += `    <error>${xe(a.error)}</error>\n`; return s + '  </app>\n'; }
+    if (a.error) s += `    <error>${xe(a.error)}</error>\n`;
+    return s + '  </app>\n';
+  }
+  function rowsToXml(cat, rows) {
+    let s = `<${CATLABEL[cat]}>\n`;
+    for (const r of rows) { s += `  <${ITEMNAME[cat] || 'row'}>\n`; for (const [k, v] of Object.entries(r)) s += `    <${k}>${xe(flat(v))}</${k}>\n`; s += `  </${ITEMNAME[cat] || 'row'}>\n`; }
+    return s + `</${CATLABEL[cat]}>\n`;
+  }
 
-  function dl(name, content, mime) { const b = new Blob([content], { type: mime + ';charset=utf-8;' }); const u = URL.createObjectURL(b); const a = Object.assign(document.createElement('a'), { href: u, download: name }); document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(u); }
+  // ---------- ZIP (store, без библиотек) ----------
+  const CRC_TABLE = (() => { const t = new Uint32Array(256); for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1); t[n] = c >>> 0; } return t; })();
+  const crc32 = data => { let c = 0xFFFFFFFF; for (let i = 0; i < data.length; i++) c = CRC_TABLE[(c ^ data[i]) & 0xFF] ^ (c >>> 8); return (c ^ 0xFFFFFFFF) >>> 0; };
+  function makeZip(files) {
+    const enc = new TextEncoder();
+    const now = new Date();
+    const dosTime = (now.getHours() << 11) | (now.getMinutes() << 5) | (now.getSeconds() >> 1);
+    const dosDate = (((now.getFullYear() - 1980) & 0x7F) << 9) | ((now.getMonth() + 1) << 5) | now.getDate();
+    const parts = [], central = []; let offset = 0, count = 0;
+    for (const f of files) {
+      const nameB = enc.encode(f.name), data = f.data, crc = crc32(data);
+      const lh = new DataView(new ArrayBuffer(30));
+      lh.setUint32(0, 0x04034b50, true); lh.setUint16(4, 20, true); lh.setUint16(6, 0x0800, true);
+      lh.setUint16(8, 0, true);
+      lh.setUint16(10, dosTime, true); lh.setUint16(12, dosDate, true);
+      lh.setUint32(14, crc, true); lh.setUint32(18, data.length, true); lh.setUint32(22, data.length, true);
+      lh.setUint16(26, nameB.length, true);
+      parts.push(new Uint8Array(lh.buffer), nameB, data);
+      const cd = new DataView(new ArrayBuffer(46));
+      cd.setUint32(0, 0x02014b50, true); cd.setUint16(4, 20, true); cd.setUint16(6, 20, true); cd.setUint16(8, 0x0800, true);
+      cd.setUint16(12, dosTime, true); cd.setUint16(14, dosDate, true);
+      cd.setUint32(16, crc, true); cd.setUint32(20, data.length, true); cd.setUint32(24, data.length, true);
+      cd.setUint16(28, nameB.length, true); cd.setUint32(42, offset, true);
+      central.push(new Uint8Array(cd.buffer), nameB);
+      offset += 30 + nameB.length + data.length; count++;
+    }
+    const cdSize = central.reduce((s, a) => s + a.length, 0);
+    const eocd = new DataView(new ArrayBuffer(22));
+    eocd.setUint32(0, 0x06054b50, true); eocd.setUint16(8, count, true); eocd.setUint16(10, count, true);
+    eocd.setUint32(12, cdSize, true); eocd.setUint32(16, offset, true);
+    return new Blob([...parts, ...central, new Uint8Array(eocd.buffer)], { type: 'application/zip' });
+  }
 
-  async function exportAll(apps, sel, fmt, delim, oneFile) {
-    const cats = ['general', 'variables', 'dimensions', 'measures', 'sheets'].filter(c => sel[c]);
-    const stamp = ts(); let files = 0;
+  // ---------- эмиттер файлов: напрямую или в ZIP, с уникальными именами ----------
+  function makeEmitter(zipMode) {
+    const used = new Set(); const entries = []; const enc = new TextEncoder();
+    const uniq = n => { let f = n, i = 2; while (used.has(f)) f = n.replace(/(\.[a-z0-9]+)$/i, `_${i++}$1`); used.add(f); return f; };
+    const dlBlob = (name, blob) => { const u = URL.createObjectURL(blob); const a = Object.assign(document.createElement('a'), { href: u, download: name }); document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(u); };
+    return {
+      async emit(name, content, mime) {
+        name = uniq(name);
+        if (zipMode) entries.push({ name, data: enc.encode(content) });
+        else { dlBlob(name, new Blob([content], { type: mime + ';charset=utf-8;' })); await sleep(280); }
+      },
+      finish(stamp) {
+        if (!zipMode || !entries.length) return 0;
+        if (entries.length > 65000) log('Внимание: файлов больше 65000 — формат ZIP без ZIP64 может не открыться; сократи объём или выключи ZIP.');
+        dlBlob(`kerbatov_export_${stamp}.zip`, makeZip(entries));
+        return entries.length;
+      },
+    };
+  }
 
-    // ---- JSON / XML: всё (включая скрипт) внутри объекта приложения ----
-    if (fmt === 'json' || fmt === 'xml') {
-      if (!cats.length && !sel.script) return 0;
-      const head = '\uFEFF<?xml version="1.0" encoding="UTF-8"?>\n';
-      if (oneFile) {
-        if (fmt === 'json') dl(`qlik_meta_${stamp}.json`, JSON.stringify({ generatedAt: new Date().toISOString(), apps: apps.map(a => appToObj(a, sel)) }, null, 2), 'application/json');
-        else dl(`qlik_meta_${stamp}.xml`, head + `<export generatedAt="${xe(new Date().toISOString())}">\n` + apps.map(a => appToXml(a, sel)).join('') + '</export>\n', 'application/xml');
-        files++;
-      } else {
-        for (const a of apps) {
-          if (fmt === 'json') dl(`${safe(a.appName || a.appId)}.json`, JSON.stringify(appToObj(a, sel), null, 2), 'application/json');
-          else dl(`${safe(a.appName || a.appId)}.xml`, head + appToXml(a, sel), 'application/xml'); // без де-индента: не портим CDATA скрипта
-          files++; await sleep(300);
+  // ---------- экспорт: perApp × perCat ----------
+  async function exportAll(apps, sel, fmt, delim, perApp, perCat, em, stamp) {
+    const cats = ['general', ...DATA_CATS, 'script'].filter(c => sel[c]);
+    if (!cats.length) return 0;
+    let files = 0;
+    const groups = perApp ? apps.map(a => ({ tag: safe(a.appName || a.appId), apps: [a] })) : [{ tag: null, apps }];
+
+    for (const g of groups) {
+      const base = g.tag ? g.tag : `qlik_${stamp}`;
+      if (perCat) {
+        for (const cat of cats) {
+          if (cat === 'script' && perApp) { await em.emit(`${base}.qvs`, '\uFEFF' + (g.apps[0].script || ''), 'text/plain'); files++; continue; }
+          const fname = g.tag ? `${g.tag}_${CATLABEL[cat]}` : `qlik_${CATLABEL[cat]}_${stamp}`;
+          if (fmt === 'csv') await em.emit(`${fname}.csv`, toCSV(SCHEMA[cat], rowsFor(cat, g.apps), delim), 'text/csv');
+          else if (fmt === 'json') {
+            const payload = cat === 'script'
+              ? { generatedAt: new Date().toISOString(), scripts: g.apps.map(a => ({ appId: a.appId, appName: a.appName, scriptLines: splitLines(a.script) })) }
+              : { generatedAt: new Date().toISOString(), category: cat, rows: rowsFor(cat, g.apps) };
+            await em.emit(`${fname}.json`, JSON.stringify(payload, null, 2), 'application/json');
+          } else {
+            const body = cat === 'script'
+              ? `<scripts>\n` + g.apps.map(a => `  <app id="${xe(a.appId)}" name="${xe(a.appName)}"><script>${cdata(a.script)}</script></app>\n`).join('') + `</scripts>\n`
+              : rowsToXml(cat, rowsFor(cat, g.apps));
+            await em.emit(`${fname}.xml`, XMLHEAD + body, 'application/xml');
+          }
+          files++;
         }
-      }
-      return files;
-    }
-
-    // ---- CSV: табличные категории отдельно, скрипт — отдельным артефактом ----
-    if (cats.length) {
-      if (oneFile) { for (const cat of cats) { dl(`qlik_${cat}_${stamp}.csv`, toCSV(SCHEMA[cat], rowsFor(cat, apps), delim), 'text/csv'); files++; await sleep(350); } }
-      else { for (const a of apps) for (const cat of cats) { dl(`${safe(a.appName || a.appId)}_${cat}.csv`, toCSV(SCHEMA[cat], rowsFor(cat, [a]), delim), 'text/csv'); files++; await sleep(300); } }
-    }
-    if (sel.script) {
-      if (oneFile) {
-        const escc = v => { v = String(v == null ? '' : v); return (v.includes(delim) || v.includes('"') || /[\r\n]/.test(v)) ? '"' + v.replace(/"/g, '""') + '"' : v; };
-        const lines = ['appId' + delim + 'appName' + delim + 'line'];
-        for (const a of apps) { const body = (a.script || '').split(/\r\n|\n|\r/); for (const ln of body) lines.push(escc(a.appId) + delim + escc(a.appName) + delim + escc(ln)); }
-        dl(`qlik_scripts_${stamp}.csv`, '\uFEFF' + lines.join('\r\n'), 'text/csv'); files++; await sleep(350);
       } else {
-        for (const a of apps) { dl(`${safe(a.appName || a.appId)}.qvs`, '\uFEFF' + (a.script || ''), 'text/plain'); files++; await sleep(300); }
+        const fname = g.tag ? g.tag : `qlik_meta_${stamp}`;
+        if (fmt === 'json') { await em.emit(`${fname}.json`, JSON.stringify({ generatedAt: new Date().toISOString(), apps: g.apps.map(a => appToObj(a, sel)) }, null, 2), 'application/json'); files++; }
+        else if (fmt === 'xml') { await em.emit(`${fname}.xml`, XMLHEAD + `<export generatedAt="${xe(new Date().toISOString())}">\n` + g.apps.map(a => appToXml(a, sel)).join('') + '</export>\n', 'application/xml'); files++; }
+        else {
+          const parts = [];
+          for (const cat of cats) parts.push(`#=== ${CATLABEL[cat]} ===`, toCSV(SCHEMA[cat], rowsFor(cat, g.apps), delim, false));
+          await em.emit(`${fname}.csv`, '\uFEFF' + parts.join('\r\n'), 'text/csv'); files++;
+        }
       }
     }
     return files;
@@ -183,7 +359,7 @@
 
   // ---------- UI ----------
   const css = `
-  #qme-panel{position:fixed;top:20px;right:20px;width:372px;max-height:92vh;overflow:auto;z-index:2147483647;background:#fbfbfd;color:#1d2330;border:1px solid #d7dbe3;border-radius:12px;box-shadow:0 14px 44px rgba(20,28,45,.26);font:13.5px/1.45 -apple-system,Segoe UI,Roboto,Arial,sans-serif}
+  #qme-panel{position:fixed;top:20px;right:20px;width:384px;max-height:92vh;overflow:auto;z-index:2147483647;background:#fbfbfd;color:#1d2330;border:1px solid #d7dbe3;border-radius:12px;box-shadow:0 14px 44px rgba(20,28,45,.26);font:13.5px/1.45 -apple-system,Segoe UI,Roboto,Arial,sans-serif}
   #qme-panel *{box-sizing:border-box}
   #qme-panel::-webkit-scrollbar{width:10px}
   #qme-panel::-webkit-scrollbar-thumb{background:#cdd2dc;border-radius:6px;border:2px solid #fbfbfd}
@@ -194,17 +370,34 @@
   #qme-head button:hover{background:rgba(255,255,255,.3)}
   .qme-body{padding:16px}
   .qme-sec{background:#fff;border:1px solid #e6e9f0;border-radius:10px;padding:11px 13px;margin-bottom:12px}
-  .qme-sec>label.t{display:block;font-weight:700;font-size:11px;text-transform:uppercase;letter-spacing:.6px;margin-bottom:8px;color:#6a7390}
+  .qme-sec>.t{display:flex;justify-content:space-between;align-items:center;font-weight:700;font-size:11px;text-transform:uppercase;letter-spacing:.6px;margin-bottom:8px;color:#6a7390}
+  .qme-toggle{font-weight:600;font-size:10.5px;text-transform:none;letter-spacing:0;color:#7a68c4;cursor:pointer;user-select:none}
+  .qme-toggle:hover{text-decoration:underline}
   .qme-row{display:flex;align-items:center;gap:8px;padding:3px 0;cursor:pointer}
   .qme-row label{cursor:pointer;user-select:none}
-  .qme-row input[type=radio],.qme-row input[type=checkbox]{margin:0;width:15px;height:15px;accent-color:#5b4b9e;cursor:pointer}
+  .qme-row input[type=radio],.qme-row input[type=checkbox]{margin:0;width:15px;height:15px;accent-color:#5b4b9e;cursor:pointer;flex:none}
+  .qme-opt{margin-top:9px;padding-top:9px;border-top:1px dashed #e2e5ee}
+  .qme-opt .qme-row label{font-size:12.5px;color:#4b5470}
+  .qme-inline{display:flex;align-items:center;gap:8px;margin-top:6px}
+  .qme-inline label{font-size:12.5px;color:#4b5470}
   #qme-panel input[type=text],#qme-panel textarea{width:100%;padding:8px 9px;border:1px solid #d2d7e1;border-radius:7px;font:inherit;margin-top:8px;background:#fff;color:#1d2330;transition:border-color .15s,box-shadow .15s}
+  #qme-panel input[type=text].qme-small{width:56px;margin-top:0;text-align:center;padding:5px 6px}
   #qme-panel input[type=text]:focus,#qme-panel textarea:focus{outline:0;border-color:#7a68c4;box-shadow:0 0 0 3px rgba(122,104,196,.16)}
   #qme-panel textarea{min-height:64px;resize:vertical;font-family:ui-monospace,Consolas,monospace;font-size:12px}
-  #qme-run{width:100%;padding:11px;background:linear-gradient(135deg,#2f8a3e,#1f6e34);color:#fff;border:0;border-radius:9px;font-weight:700;font-size:14.5px;letter-spacing:.3px;cursor:pointer;box-shadow:0 4px 12px rgba(31,110,52,.28);transition:filter .15s,transform .05s}
+  .qme-hint{font-size:11px;color:#8a91a8;margin-top:4px}
+  .qme-btns{display:flex;gap:8px}
+  #qme-run{flex:1;padding:11px;background:linear-gradient(135deg,#2f8a3e,#1f6e34);color:#fff;border:0;border-radius:9px;font-weight:700;font-size:14.5px;letter-spacing:.3px;cursor:pointer;box-shadow:0 4px 12px rgba(31,110,52,.28);transition:filter .15s,transform .05s}
   #qme-run:hover{filter:brightness(1.07)}
   #qme-run:active{transform:translateY(1px)}
   #qme-run:disabled{background:#9db8a3;box-shadow:none;cursor:default;filter:none}
+  #qme-retry{width:auto;padding:11px 12px;background:#fff;color:#5b4b9e;border:1px solid #cfc6ec;border-radius:9px;font-weight:700;font-size:13px;cursor:pointer;transition:background .15s}
+  #qme-retry:hover:not(:disabled){background:#f3f0fb}
+  #qme-retry:disabled{color:#c6cbd8;border-color:#e4e7ee;cursor:default}
+  #qme-stop{width:74px;padding:11px;background:#fff;color:#b03636;border:1px solid #e0b9b9;border-radius:9px;font-weight:700;font-size:13.5px;cursor:pointer;transition:background .15s}
+  #qme-stop:hover:not(:disabled){background:#fbeeee}
+  #qme-stop:disabled{color:#c6cbd8;border-color:#e4e7ee;cursor:default}
+  #qme-prog{margin-top:12px;height:7px;background:#e8eaf1;border-radius:4px;overflow:hidden;display:none}
+  #qme-prog>div{height:100%;width:0;background:linear-gradient(90deg,#5b4b9e,#7a68c4);border-radius:4px;transition:width .25s}
   #qme-log{margin-top:12px;background:#171c28;border-radius:8px;padding:9px 10px;font:11.5px/1.4 ui-monospace,Consolas,monospace;white-space:pre-wrap;word-break:break-word;max-height:170px;overflow:auto;color:#c9d2e3}
   #qme-log:empty{display:none}
   .qme-hide{display:none}`;
@@ -218,49 +411,103 @@
     </div>
     <div class="qme-body">
       <div class="qme-sec">
-        <label class="t">Источник</label>
+        <div class="t">Приложения</div>
         <div class="qme-row"><input type="radio" name="qme-src" id="qme-src-cur" value="current" checked><label for="qme-src-cur">Текущее приложение</label></div>
         <div class="qme-row"><input type="radio" name="qme-src" id="qme-src-list" value="list"><label for="qme-src-list">Список appId</label></div>
         <div class="qme-row"><input type="radio" name="qme-src" id="qme-src-stream" value="stream"><label for="qme-src-stream">Поток (по имени)</label></div>
         <div class="qme-row"><input type="radio" name="qme-src" id="qme-src-all" value="all"><label for="qme-src-all">Все приложения на сервере</label></div>
         <textarea id="qme-ids" class="qme-hide" placeholder="appId через пробел, запятую или с новой строки"></textarea>
         <input type="text" id="qme-stream" class="qme-hide" value="Т_Перенос" placeholder="Имя потока">
+        <input type="text" id="qme-mask" class="qme-hide" placeholder="Маска имени приложения, напр. *Финанс* или Отчет_20??">
+        <div class="qme-hint qme-hide" id="qme-mask-hint">* — любые символы, ? — один символ; пусто = без фильтра</div>
+        <div class="qme-opt">
+          <div class="qme-row"><input type="checkbox" id="qme-per-app"><label for="qme-per-app">Отдельный файл на каждое приложение</label></div>
+        </div>
       </div>
       <div class="qme-sec">
-        <label class="t">Данные</label>
+        <div class="t"><span>Данные</span><span class="qme-toggle" id="qme-datatoggle">все / нет</span></div>
         <div class="qme-row"><input type="checkbox" id="qme-d-measures" checked><label for="qme-d-measures">Меры</label></div>
         <div class="qme-row"><input type="checkbox" id="qme-d-dimensions" checked><label for="qme-d-dimensions">Измерения</label></div>
         <div class="qme-row"><input type="checkbox" id="qme-d-variables" checked><label for="qme-d-variables">Переменные</label></div>
         <div class="qme-row"><input type="checkbox" id="qme-d-sheets"><label for="qme-d-sheets">Листы (Id + thumbnail)</label></div>
-        <div class="qme-row"><input type="checkbox" id="qme-d-general"><label for="qme-d-general">Общая инфа + thumbnail</label></div>
+        <div class="qme-row"><input type="checkbox" id="qme-d-bookmarks"><label for="qme-d-bookmarks">Закладки</label></div>
+        <div class="qme-row"><input type="checkbox" id="qme-d-masterobjects"><label for="qme-d-masterobjects">Мастер-объекты (визуализации)</label></div>
+        <div class="qme-row"><input type="checkbox" id="qme-d-general"><label for="qme-d-general">Общая инфа (thumbnail, тема, поток)</label></div>
         <div class="qme-row"><input type="checkbox" id="qme-d-script"><label for="qme-d-script">Скрипты загрузки</label></div>
+        <div class="qme-opt">
+          <div class="qme-row"><input type="checkbox" id="qme-per-cat" checked><label for="qme-per-cat">Отдельный файл для каждого вида данных</label></div>
+        </div>
       </div>
       <div class="qme-sec">
-        <label class="t">Формат</label>
+        <div class="t">Формат</div>
         <div class="qme-row"><input type="radio" name="qme-fmt" id="qme-fmt-csv" value="csv" checked><label for="qme-fmt-csv">CSV</label></div>
         <div class="qme-row"><input type="radio" name="qme-fmt" id="qme-fmt-json" value="json"><label for="qme-fmt-json">JSON</label></div>
         <div class="qme-row"><input type="radio" name="qme-fmt" id="qme-fmt-xml" value="xml"><label for="qme-fmt-xml">XML</label></div>
         <input type="text" id="qme-delim" value="|" placeholder="Разделитель CSV" maxlength="3">
+        <div class="qme-opt">
+          <div class="qme-row"><input type="checkbox" id="qme-zip"><label for="qme-zip">Упаковать всё в один ZIP</label></div>
+          <div class="qme-row"><input type="checkbox" id="qme-dry"><label for="qme-dry">Только проверка (сводка без скачивания)</label></div>
+          <div class="qme-inline"><label for="qme-limit">Параллельно приложений:</label><input type="text" class="qme-small" id="qme-limit" value="3" maxlength="1"></div>
+        </div>
       </div>
-      <div class="qme-sec">
-        <label class="t">Файлы</label>
-        <div class="qme-row"><input type="radio" name="qme-file" id="qme-file-one" value="one" checked><label for="qme-file-one">Один файл</label></div>
-        <div class="qme-row"><input type="radio" name="qme-file" id="qme-file-sep" value="sep"><label for="qme-file-sep">Отдельный на каждое приложение</label></div>
+      <div class="qme-btns">
+        <button id="qme-run">Запуск</button>
+        <button id="qme-retry" disabled title="Повторный прогон только приложений с ошибками">Повтор ошибок</button>
+        <button id="qme-stop" disabled>Стоп</button>
       </div>
-      <button id="qme-run">Запуск</button>
+      <div id="qme-prog"><div></div></div>
       <div id="qme-log"></div>
     </div>`;
   document.body.appendChild(panel);
 
   const $ = s => panel.querySelector(s);
-  const logEl = $('#qme-log');
+  const logEl = $('#qme-log'), progEl = $('#qme-prog'), progBar = $('#qme-prog>div');
   function log(msg) { const t = new Date().toLocaleTimeString(); logEl.textContent += `[${t}] ${msg}\n`; logEl.scrollTop = logEl.scrollHeight; console.log('[qme]', msg); }
+  function setProgress(done, total) { if (total <= 0) { progEl.style.display = 'none'; return; } progEl.style.display = 'block'; progBar.style.width = Math.round(done / total * 100) + '%'; }
+
+  // ---------- автосохранение настроек ----------
+  const SKEY = 'kmd_settings_v4';
+  const FIELDS = {
+    radios: ['qme-src', 'qme-fmt'],
+    checks: ['qme-per-app', 'qme-per-cat', 'qme-zip', 'qme-dry', 'qme-d-measures', 'qme-d-dimensions', 'qme-d-variables', 'qme-d-sheets', 'qme-d-bookmarks', 'qme-d-masterobjects', 'qme-d-general', 'qme-d-script'],
+    texts: ['qme-ids', 'qme-stream', 'qme-mask', 'qme-delim', 'qme-limit'],
+  };
+  function saveSettings() {
+    try {
+      const s = { r: {}, c: {}, t: {} };
+      for (const n of FIELDS.radios) s.r[n] = panel.querySelector(`input[name=${n}]:checked`)?.value;
+      for (const id of FIELDS.checks) s.c[id] = $('#' + id).checked;
+      for (const id of FIELDS.texts) s.t[id] = $('#' + id).value;
+      localStorage.setItem(SKEY, JSON.stringify(s));
+    } catch {}
+  }
+  function loadSettings() {
+    try {
+      const s = JSON.parse(localStorage.getItem(SKEY) || 'null'); if (!s) return;
+      for (const n of FIELDS.radios) { const el = panel.querySelector(`input[name=${n}][value="${s.r?.[n]}"]`); if (el) el.checked = true; }
+      for (const id of FIELDS.checks) if (id in (s.c || {})) $('#' + id).checked = !!s.c[id];
+      for (const id of FIELDS.texts) if (id in (s.t || {})) $('#' + id).value = s.t[id];
+    } catch {}
+  }
+  loadSettings();
+  panel.querySelectorAll('input,textarea').forEach(el => el.addEventListener('change', saveSettings));
+
+  // переключатель «все / нет» для типов данных
+  const DATA_CHECK_IDS = ['qme-d-measures', 'qme-d-dimensions', 'qme-d-variables', 'qme-d-sheets', 'qme-d-bookmarks', 'qme-d-masterobjects', 'qme-d-general', 'qme-d-script'];
+  $('#qme-datatoggle').onclick = () => {
+    const anyOff = DATA_CHECK_IDS.some(id => !$('#' + id).checked);
+    DATA_CHECK_IDS.forEach(id => { $('#' + id).checked = anyOff; });
+    saveSettings();
+  };
 
   // показ/скрытие зависимых полей
   const sync = () => {
     const src = panel.querySelector('input[name=qme-src]:checked').value;
     $('#qme-ids').classList.toggle('qme-hide', src !== 'list');
     $('#qme-stream').classList.toggle('qme-hide', src !== 'stream');
+    const maskVisible = (src === 'stream' || src === 'all');
+    $('#qme-mask').classList.toggle('qme-hide', !maskVisible);
+    $('#qme-mask-hint').classList.toggle('qme-hide', !maskVisible);
     const fmt = panel.querySelector('input[name=qme-fmt]:checked').value;
     $('#qme-delim').classList.toggle('qme-hide', fmt !== 'csv');
   };
@@ -273,38 +520,101 @@
     document.addEventListener('mousemove', e => { if (!drag) return; panel.style.left = (e.clientX - dx) + 'px'; panel.style.top = Math.max(0, e.clientY - dy) + 'px'; });
     document.addEventListener('mouseup', () => drag = false); })();
 
-  // запуск
-  $('#qme-run').onclick = async () => {
-    const btn = $('#qme-run'); btn.disabled = true; logEl.textContent = '';
+  // кнопка Стоп
+  $('#qme-stop').onclick = () => { ABORT = true; log('Остановка по запросу — доделываю текущие приложения…'); $('#qme-stop').disabled = true; };
+
+  // ---------- основной прогон ----------
+  async function runExport(appsOverride) {
+    const btnRun = $('#qme-run'), btnStop = $('#qme-stop'), btnRetry = $('#qme-retry');
+    btnRun.disabled = true; btnRetry.disabled = true; btnStop.disabled = false; ABORT = false;
+    logEl.textContent = ''; setProgress(0, 0);
     try {
       const cfg = {
         source: panel.querySelector('input[name=qme-src]:checked').value,
-        idsText: $('#qme-ids').value, streamName: $('#qme-stream').value.trim(),
+        idsText: $('#qme-ids').value, streamName: $('#qme-stream').value.trim(), mask: $('#qme-mask').value.trim(),
       };
-      const sel = { measures: $('#qme-d-measures').checked, dimensions: $('#qme-d-dimensions').checked, variables: $('#qme-d-variables').checked, sheets: $('#qme-d-sheets').checked, general: $('#qme-d-general').checked, script: $('#qme-d-script').checked };
+      const sel = {
+        measures: $('#qme-d-measures').checked, dimensions: $('#qme-d-dimensions').checked, variables: $('#qme-d-variables').checked,
+        sheets: $('#qme-d-sheets').checked, bookmarks: $('#qme-d-bookmarks').checked, masterobjects: $('#qme-d-masterobjects').checked,
+        general: $('#qme-d-general').checked, script: $('#qme-d-script').checked,
+      };
       const fmt = panel.querySelector('input[name=qme-fmt]:checked').value;
       const delim = ($('#qme-delim').value || '|');
-      const oneFile = panel.querySelector('input[name=qme-file]:checked').value === 'one';
+      const perApp = $('#qme-per-app').checked;
+      const perCat = $('#qme-per-cat').checked;
+      const zipMode = $('#qme-zip').checked;
+      const dryRun = $('#qme-dry').checked;
+      const LIMIT = Math.min(8, Math.max(1, parseInt($('#qme-limit').value, 10) || 3));
+
+      // предпроверки
       if (!Object.values(sel).some(Boolean)) throw new Error('Не отмечено ни одного типа данных.');
+      if (fmt === 'csv' && (/^[\p{L}\p{N}]+$/u.test(delim) || delim.includes('"'))) throw new Error(`Разделитель "${delim}" не годится (буквы/цифры/кавычки исказят данные).`);
 
-      log('Получаю CSRF-токен…'); await getCsrf(); log('CSRF: ' + (CSRF ? 'ок' : 'не найден (продолжаю)'));
-      log('Определяю список приложений…'); const apps = await resolveApps(cfg); log(`Приложений: ${apps.length}`);
-      if (!apps.length) throw new Error('Пустой список приложений.');
+      log('Определяю прокси и CSRF-токен…'); await authDetect();
+      log('Проверяю соединение с движком…');
+      try { const probe = await openWs('engineData'); try { await probe.call('GetDocList', -1, []); } finally { probe.close(); } log('Движок: ок'); }
+      catch (e) { throw new Error('Движок недоступен (' + (e.message || e) + '). Похоже на неверный прокси-префикс или устаревшую сессию — обнови страницу (F5), авторизуйся и перезапусти панель.'); }
 
+      let apps;
+      if (appsOverride) { apps = appsOverride; log(`Повторный прогон приложений с ошибками: ${apps.length}`); }
+      else {
+        log('Определяю список приложений…');
+        apps = await resolveApps(cfg);
+        log(`Приложений: ${apps.length}`);
+        if (!apps.length) throw new Error('Пустой список приложений.');
+        if (apps.length > 50 && !dryRun && !confirm(`Будет обработано ${apps.length} приложений. Это может занять заметное время. Продолжить?`)) throw new Error('Отменено пользователем.');
+      }
+
+      const runStamp = ts();   // единый штамп времени на прогон — все файлы датируются одинаково
       const results = []; let done = 0;
-      const LIMIT = 3, queue = apps.slice();
+      setProgress(0, apps.length);
+      const queue = apps.slice();
       await Promise.all(Array.from({ length: Math.min(LIMIT, apps.length) }, async () => {
-        while (queue.length) { const a = queue.shift(); const r = await collectApp(a.id, sel); if (a.name && !r.appName) r.appName = a.name;
-          results.push(r); done++; log(`[${done}/${apps.length}] ${r.appName || a.id}${r.error ? ' — ОШИБКА: ' + r.error : ` (мер:${r.measures.length} изм:${r.dimensions.length} перем:${r.variables.length} лист:${r.sheets.length} скрипт:${r.script ? r.script.length : 0})`}`); }
+        while (queue.length && !ABORT) {
+          const a = queue.shift();
+          const r = await collectWithRetry(a.id, sel);
+          if (a.name && !r.appName) r.appName = a.name;
+          results.push(r); done++; setProgress(done, apps.length);
+          log(`[${done}/${apps.length}] ${r.appName || a.id}${r.error ? ' — ОШИБКА: ' + r.error : ` (мер:${r.measures.length} изм:${r.dimensions.length} перем:${r.variables.length} лист:${r.sheets.length} зкл:${r.bookmarks.length} мо:${r.masterobjects.length} скрипт:${r.script ? r.script.length : 0})`}`);
+        }
       }));
-      results.sort((a, b) => apps.findIndex(x => x.id === a.appId) - apps.findIndex(x => x.id === b.appId));
+      if (ABORT) log(`Прервано: обработано ${results.length} из ${apps.length} — выгружаю собранное.`);
+      const order = new Map(apps.map((x, i) => [x.id, i]));
+      results.sort((a, b) => (order.get(a.appId) ?? 0) - (order.get(b.appId) ?? 0));
 
-      log('Формирую файлы…'); const n = await exportAll(results, sel, fmt, delim, oneFile);
-      log(`Готово. Скачано файлов: ${n}. Ошибок: ${results.filter(r => r.error).length}.`);
+      if (sel.general) { log('Обогащаю общую инфу из QRS (поток, публикация)…'); await enrichFromQrs(results); }
+
+      const errs = results.filter(r => r.error);
+      LAST_FAILED = errs.map(r => ({ id: r.appId, name: r.appName }));
       window.__qlikExport = results;
+
+      if (dryRun) {
+        const sum = c => results.reduce((s, r) => s + (Array.isArray(r[c]) ? r[c].length : 0), 0);
+        log(`ПРОВЕРКА (файлы не скачаны): приложений ${results.length} · мер ${sum('measures')} · изм ${sum('dimensions')} · перем ${sum('variables')} · листов ${sum('sheets')} · закладок ${sum('bookmarks')} · мастер-объектов ${sum('masterobjects')} · скриптов с текстом ${results.filter(r => r.script).length} · ошибок ${errs.length}`);
+        if (errs.length) log('С ошибками: ' + errs.map(r => (r.appName || r.appId) + ' (' + r.error + ')').join('; '));
+        log('Результат в window.__qlikExport — можно посмотреть в консоли.');
+        return;
+      }
+
+      log('Формирую файлы…');
+      const em = makeEmitter(zipMode);
+      const n = await exportAll(results, sel, fmt, delim, perApp, perCat, em, runStamp);
+      if (errs.length) await em.emit(`qlik_errors_${runStamp}.txt`, '\uFEFF' + errs.map(r => `${r.appId}|${r.appName || ''}|${r.error}`).join('\r\n'), 'text/plain');
+      const packed = em.finish(runStamp);
+      log(zipMode
+        ? `Готово. В ZIP-архиве файлов: ${packed}. Ошибок: ${errs.length}.`
+        : `Готово. Скачано файлов: ${n + (errs.length ? 1 : 0)}. Ошибок: ${errs.length}.`);
+      if (errs.length) log('С ошибками: ' + errs.map(r => (r.appName || r.appId) + ' (' + r.error + ')').join('; '));
     } catch (e) { log('СБОЙ: ' + (e.message || e)); }
-    finally { btn.disabled = false; }
-  };
+    finally {
+      $('#qme-run').disabled = false; $('#qme-stop').disabled = true;
+      $('#qme-retry').disabled = !LAST_FAILED.length;
+      if (LAST_FAILED.length) log(`Кнопка «Повтор ошибок» перегонит ${LAST_FAILED.length} сбойных приложений с текущими настройками.`);
+    }
+  }
+
+  $('#qme-run').onclick = () => runExport(null);
+  $('#qme-retry').onclick = () => { if (LAST_FAILED.length) runExport(LAST_FAILED.slice()); };
 
   log('Панель готова. Настрой и нажми «Запуск».');
 })();
