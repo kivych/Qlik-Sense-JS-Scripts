@@ -1,5 +1,5 @@
 /* ============================================================================
- * Kerbatov metadata downloader · экспорт метаданных Qlik Sense
+ * Kerbatov UI Qlik Downloader · экспорт метаданных Qlik Sense
  * ----------------------------------------------------------------------------
  * Вставь весь файл в консоль DevTools, будучи авторизованным в Qlik Sense.
  * Запускать со страницы, где есть живая сессия и доступ к движку:
@@ -41,7 +41,7 @@
  *             автосохранение настроек · уникальные имена файлов ·
  *             единый штамп времени на прогон
  * ============================================================================
- * Kerbatov metadata downloader · Qlik Sense metadata export
+ * Kerbatov UI Qlik Downloader  · Qlik Sense metadata export
  * ----------------------------------------------------------------------------
  * Paste the whole file into the DevTools console while logged in to Qlik Sense.
  * Run it from a page that has a live session and engine access:
@@ -719,7 +719,7 @@
   const panel = document.createElement('div'); panel.id = 'qme-panel';
   panel.innerHTML = `
     <div id="qme-head">
-      <div><div class="qme-title">Kerbatov metadata downloader</div><div class="qme-sub" data-i18n="subtitle">Qlik Sense · экспорт метаданных</div></div>
+      <div><div class="qme-title">Kerbatov UI Qlik Downloader </div><div class="qme-sub" data-i18n="subtitle">Qlik Sense · экспорт метаданных</div></div>
       <div class="qme-headright">
         <div class="qme-lang"><span class="qme-lang-b" data-lang="ru">RU</span><span class="qme-lang-b" data-lang="en">EN</span></div>
         <button title="Закрыть" data-i18n-title="close">×</button>
