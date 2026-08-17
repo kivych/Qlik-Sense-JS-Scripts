@@ -1,4 +1,4 @@
-1. Open WebSocket on QS Server and check connection https://community.qlik.com/t5/Official-Support-Articles/Qlik-Sense-WebSocket-Connectivity-Tester/ta-p/1716909
+1. Open WebSocket on QS Server and check connection https://community.qlik.com/t5/Official-Support-Articles/Qlik-Sense-WebSocket-Connectivity-Tester/ta-p/1716909 (skip this step for Kerbatov UI Qlik Downloader)
 2. Open any QS App
 3. Open Chrome DevTools
 4. Open Console tab
