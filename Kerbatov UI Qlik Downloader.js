@@ -1,5 +1,5 @@
 /* ============================================================================
- * Kerbatov UI Qlik Downloader · экспорт метаданных Qlik Sense
+ * Kerbatov metadata downloader · экспорт метаданных Qlik Sense
  * ----------------------------------------------------------------------------
  * Вставь весь файл в консоль DevTools, будучи авторизованным в Qlik Sense.
  * Запускать со страницы, где есть живая сессия и доступ к движку:
@@ -41,7 +41,7 @@
  *             автосохранение настроек · уникальные имена файлов ·
  *             единый штамп времени на прогон
  * ============================================================================
- * Kerbatov UI Qlik Downloader  · Qlik Sense metadata export
+ * Kerbatov metadata downloader · Qlik Sense metadata export
  * ----------------------------------------------------------------------------
  * Paste the whole file into the DevTools console while logged in to Qlik Sense.
  * Run it from a page that has a live session and engine access:
@@ -388,28 +388,39 @@
     finally { conn?.close(); }
   }
 
+  // рекурсивно собрать значения свойства qLibraryId (ссылки на мастер-меры/измерения)
+  function collectLibIds(v, acc) {
+    if (v == null || typeof v !== 'object') return;
+    if (Array.isArray(v)) { for (const x of v) collectLibIds(x, acc); return; }
+    for (const k in v) { if (k === 'qLibraryId' && typeof v[k] === 'string' && v[k]) acc.add(v[k]); collectLibIds(v[k], acc); }
+  }
+
   async function scanObjects(appId, needle, ci) {
     const out = []; let conn;
     const nd = ci ? needle.toLowerCase() : needle;
     const hit = s => (ci ? String(s || '').toLowerCase() : String(s || '')).indexOf(nd) !== -1;
     const any = (...vals) => vals.some(v => Array.isArray(v) ? v.some(hit) : hit(v));
+    const matchedMasters = new Map();   // id совпавшей мастер-меры/измерения → подпись для ссылок из объектов
     try {
       conn = await openWs(appId);
       const appH = (await conn.call('OpenDoc', -1, [appId, '', '', '', true])).qReturn.qHandle;
       const fetchList = await makeListFetcher(conn, appH);
-      const propsOf = async id => { try { const h = (await conn.call('GetObject', appH, [id])).qReturn?.qHandle; if (!h) return null; const p = await conn.call('GetProperties', h, []); return p.qProp || p; } catch { return null; } };
+      // полные свойства объекта: объект/измерение/мера открываются РАЗНЫМИ методами движка
+      const propsVia = async (method, id) => { try { const h = (await conn.call(method, appH, [id])).qReturn?.qHandle; if (!h) return null; const p = await conn.call('GetProperties', h, []); return p.qProp || p; } catch { return null; } };
 
-      // меры
+      // меры: быстрая проверка по списку, при промахе — глубокий разбор свойств через GetMeasure
       for (const m of await fetchList(...LISTDEFS.measures)) {
         if (ABORT) break;
-        if (any(m.qMeta?.title, m.qData?.def, m.qData?.label, m.qData?.labelExpr, m.qMeta?.description))
-          out.push({ objectType: 'measure', objectId: m.qInfo.qId, title: m.qMeta?.title || '' });
+        let matched = any(m.qMeta?.title, m.qData?.def, m.qData?.label, m.qData?.labelExpr, m.qMeta?.description);
+        if (!matched) { const p = await propsVia('GetMeasure', m.qInfo.qId); if (p && containsIn(p, nd, ci)) matched = true; }
+        if (matched) { out.push({ objectType: 'measure', objectId: m.qInfo.qId, title: m.qMeta?.title || '' }); matchedMasters.set(m.qInfo.qId, `мастер-меру «${m.qMeta?.title || m.qInfo.qId}»`); }
       }
-      // измерения
+      // измерения: то же самое через GetDimension — ловит выражения в qFieldDefs / qLabelExpression
       for (const d of await fetchList(...LISTDEFS.dimensions)) {
         if (ABORT) break;
-        if (any(d.qMeta?.title, d.qData?.fields, d.qData?.labelExpr, d.qMeta?.description))
-          out.push({ objectType: 'dimension', objectId: d.qInfo.qId, title: d.qMeta?.title || '' });
+        let matched = any(d.qMeta?.title, d.qData?.fields, d.qData?.labelExpr, d.qMeta?.description);
+        if (!matched) { const p = await propsVia('GetDimension', d.qInfo.qId); if (p && containsIn(p, nd, ci)) matched = true; }
+        if (matched) { out.push({ objectType: 'dimension', objectId: d.qInfo.qId, title: d.qMeta?.title || '' }); matchedMasters.set(d.qInfo.qId, `мастер-измерение «${d.qMeta?.title || d.qInfo.qId}»`); }
       }
       // переменные
       for (const v of await fetchList(...LISTDEFS.variables)) {
@@ -417,14 +428,14 @@
         if (any(v.qName, v.qDefinition, v.qDescription))
           out.push({ objectType: 'variable', objectId: v.qInfo?.qId || v.qName, title: v.qName || '' });
       }
-      // мастер-объекты (глубокий разбор свойств — ловит выражения внутри)
+      // мастер-объекты (глубокий разбор свойств)
       for (const o of await fetchList(...LISTDEFS.masterobjects)) {
         if (ABORT) break;
         let matched = any(o.qMeta?.title, o.qData?.title, o.qData?.description, o.qData?.visualization);
-        if (!matched) { const p = await propsOf(o.qInfo.qId); if (p && containsIn(p, nd, ci)) matched = true; }
+        if (!matched) { const p = await propsVia('GetObject', o.qInfo.qId); if (p && containsIn(p, nd, ci)) matched = true; }
         if (matched) out.push({ objectType: 'masterobject', objectId: o.qInfo.qId, title: o.qMeta?.title || o.qData?.title || '', visualization: o.qData?.visualization || '' });
       }
-      // объекты листов (глубокий разбор свойств — где живёт большинство выражений)
+      // объекты листов: свой текст (containsIn) ИЛИ ссылка на совпавшую мастер-меру/измерение
       for (const s of await fetchList(...LISTDEFS.sheets)) {
         if (ABORT) break;
         try {
@@ -434,9 +445,16 @@
           for (const inf of infos) {
             if (ABORT) break;
             const cid = inf?.qId; if (!cid) continue;
-            const p = await propsOf(cid);
-            if (p && containsIn(p, nd, ci))
-              out.push({ objectType: (p.qInfo?.qType || inf.qType || 'sheet-object'), objectId: cid, title: (p.qMetaDef?.title || p.title || ''), sheetId: s.qInfo.qId });
+            const p = await propsVia('GetObject', cid); if (!p) continue;
+            let matched = containsIn(p, nd, ci), via = '';
+            if (!matched && matchedMasters.size) {
+              const lib = new Set(); collectLibIds(p, lib);
+              for (const id of lib) if (matchedMasters.has(id)) { matched = true; via = matchedMasters.get(id); break; }
+            }
+            if (matched) {
+              const title = (p.qMetaDef?.title || p.title || '') + (via ? ` (использует ${via})` : '');
+              out.push({ objectType: (p.qInfo?.qType || inf.qType || 'sheet-object'), objectId: cid, title, sheetId: s.qInfo.qId });
+            }
           }
         } catch {}
       }
@@ -459,10 +477,16 @@
       apps = ids.map(id => ({ id }));
     } else if (cfg.source === 'stream') {
       if (!cfg.streamName) throw new Error(t('errNoStream'));
+      // сначала пробуем серверный фильтр (быстро), но если он не сработал (спецсимволы
+      // в имени потока, отказ QRS-фильтра и т.п.) — падаем на клиентскую фильтрацию,
+      // а не на ложную ошибку «QRS недоступен».
       let arr = await qrsGet(`/qrs/app/full?filter=${encodeURIComponent(`stream.name eq '${cfg.streamName}'`)}`);
-      if (!arr) throw new Error(t('errQrsStream'));
-      if (!arr.length) { const all = await qrsGet('/qrs/app/full') || []; arr = all.filter(a => a.stream && a.stream.name?.toLowerCase() === cfg.streamName.toLowerCase());
-        if (!arr.length) throw new Error(t('errStreamNotFound', cfg.streamName, [...new Set(all.filter(a => a.stream).map(a => a.stream.name))].sort().join(', '))); }
+      if (!arr || !arr.length) {
+        const all = await qrsGet('/qrs/app/full');
+        if (!all) throw new Error(t('errQrsStream'));
+        arr = all.filter(a => a.stream && a.stream.name?.toLowerCase() === cfg.streamName.toLowerCase());
+        if (!arr.length) throw new Error(t('errStreamNotFound', cfg.streamName, [...new Set(all.filter(a => a.stream).map(a => a.stream.name))].sort().join(', ')));
+      }
       apps = arr.map(a => ({ id: a.id, name: a.name }));
     } else if (cfg.source === 'all') {
       let all = await qrsGet('/qrs/app/full');
@@ -719,7 +743,7 @@
   const panel = document.createElement('div'); panel.id = 'qme-panel';
   panel.innerHTML = `
     <div id="qme-head">
-      <div><div class="qme-title">Kerbatov UI Qlik Downloader </div><div class="qme-sub" data-i18n="subtitle">Qlik Sense · экспорт метаданных</div></div>
+      <div><div class="qme-title">Kerbatov metadata downloader</div><div class="qme-sub" data-i18n="subtitle">Qlik Sense · экспорт метаданных</div></div>
       <div class="qme-headright">
         <div class="qme-lang"><span class="qme-lang-b" data-lang="ru">RU</span><span class="qme-lang-b" data-lang="en">EN</span></div>
         <button title="Закрыть" data-i18n-title="close">×</button>
@@ -975,7 +999,7 @@
     try {
       const needle = $('#qme-needle').value;
       const ci = $('#qme-ci').checked;
-      if (!needle) throw new Error(t('errNoNeedle'));
+      if (!needle.trim()) throw new Error(t('errNoNeedle'));
       const cfg = readSource();
       const fmt = panel.querySelector('input[name=qme-fmt]:checked').value;
       const delim = ($('#qme-delim').value || '|');
