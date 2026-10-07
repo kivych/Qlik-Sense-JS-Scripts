@@ -346,8 +346,13 @@
         .map(d => ({ id: d.qInfo.qId, title: d.qMeta?.title, fields: d.qData?.fields || [], labelExpr: d.qData?.labelExpr, type: grp(d.qData?.grouping), description: d.qMeta?.description, tags: d.qMeta?.tags || [] }));
       if (sel.measures) res.measures = (await fetchList(...LISTDEFS.measures))
         .map(me => ({ id: me.qInfo.qId, title: me.qMeta?.title, definition: me.qData?.def, label: me.qData?.label, labelExpr: me.qData?.labelExpr, description: me.qMeta?.description, tags: me.qMeta?.tags || [] }));
-      if (sel.sheets) res.sheets = (await fetchList('SheetList', 'qAppObjectListDef', { qType: 'sheet', qData: { title: '/qMetaDef/title', thumbnail: '/thumbnail' } }, 'qAppObjectList'))
-        .map(s => { const th = s.qData?.thumbnail; return { sheetId: s.qInfo.qId, sheetName: s.qMeta?.title, thumbnail: abs(th && (th.qStaticContentUrl?.qUrl || th.qStaticContentUrlDef?.qUrl)) }; });
+      if (sel.sheets) {
+        // порядок листов в интерфейсе задаётся свойством rank; сортируем по нему, листы без rank — в конец
+        const rk = x => { const v = parseFloat(x.qData?.rank); return Number.isFinite(v) ? v : Number.MAX_SAFE_INTEGER; };
+        res.sheets = (await fetchList('SheetList', 'qAppObjectListDef', { qType: 'sheet', qData: { title: '/qMetaDef/title', rank: '/rank', thumbnail: '/thumbnail' } }, 'qAppObjectList'))
+          .sort((a, b) => rk(a) - rk(b))
+          .map(s => { const th = s.qData?.thumbnail; return { sheetId: s.qInfo.qId, sheetName: s.qMeta?.title, rank: s.qData?.rank ?? '', thumbnail: abs(th && (th.qStaticContentUrl?.qUrl || th.qStaticContentUrlDef?.qUrl)) }; });
+      }
       if (sel.bookmarks) res.bookmarks = (await fetchList('BookmarkList', 'qBookmarkListDef', { qType: 'bookmark', qData: { title: '/qMetaDef/title', description: '/qMetaDef/description', sheetId: '/sheetId', selectionFields: '/selectionFields', creationDate: '/creationDate' } }, 'qBookmarkList'))
         .map(b => ({ id: b.qInfo.qId, title: b.qMeta?.title || b.qData?.title, description: b.qMeta?.description || b.qData?.description, sheetId: b.qData?.sheetId || '', fields: b.qData?.selectionFields || '', created: b.qData?.creationDate || '' }));
       if (sel.masterobjects) res.masterobjects = (await fetchList('MasterObjectList', 'qAppObjectListDef', { qType: 'masterobject', qData: { title: '/qMetaDef/title', description: '/qMetaDef/description', visualization: '/visualization', tags: '/qMetaDef/tags' } }, 'qAppObjectList'))
@@ -528,7 +533,7 @@
     variables:     ['appId', 'appName', 'name', 'definition', 'description', 'scriptCreated'],
     dimensions:    ['appId', 'appName', 'id', 'title', 'fields', 'labelExpr', 'type', 'description', 'tags'],
     measures:      ['appId', 'appName', 'id', 'title', 'definition', 'label', 'labelExpr', 'description', 'tags'],
-    sheets:        ['appId', 'appName', 'sheetId', 'sheetName', 'thumbnail'],
+    sheets:        ['appId', 'appName', 'sheetId', 'sheetName', 'rank', 'thumbnail'],
     bookmarks:     ['appId', 'appName', 'id', 'title', 'description', 'sheetId', 'fields', 'created'],
     masterobjects: ['appId', 'appName', 'id', 'title', 'visualization', 'description', 'tags'],
     script:        ['appId', 'appName', 'line'],
